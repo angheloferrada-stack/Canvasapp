@@ -20,15 +20,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Generar calendario desde Canvas
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Escanear Canvas y Gmail, generar calendario
         env:
           CANVAS_URL: ${{ secrets.CANVAS_URL }}
           CANVAS_TOKEN: ${{ secrets.CANVAS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
         run: python fechas.py
 
       - name: Guardar cambios en el repositorio
         run: |
           git config user.name "fechas-bot"
           git config user.email "fechas-bot@users.noreply.github.com"
-          git add docs/fechas.ics
+          git add docs/
           git diff --cached --quiet || (git commit -m "Actualizar fechas" && git push)
