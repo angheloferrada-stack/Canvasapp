@@ -1,0 +1,34 @@
+# Guardar este archivo en la ruta: .github/workflows/fechas.yml
+name: Fechas Canvas
+
+on:
+  schedule:
+    # Corre todos los días a las 11:00 UTC (08:00 en Chile en verano, 07:00 en invierno)
+    - cron: "0 11 * * *"
+  workflow_dispatch:  # permite correrlo a mano desde la pestaña Actions
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generar calendario desde Canvas
+        env:
+          CANVAS_URL: ${{ secrets.CANVAS_URL }}
+          CANVAS_TOKEN: ${{ secrets.CANVAS_TOKEN }}
+        run: python fechas.py
+
+      - name: Guardar cambios en el repositorio
+        run: |
+          git config user.name "fechas-bot"
+          git config user.email "fechas-bot@users.noreply.github.com"
+          git add docs/fechas.ics
+          git diff --cached --quiet || (git commit -m "Actualizar fechas" && git push)
