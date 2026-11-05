@@ -9,6 +9,8 @@ import json
 import os
 import pathlib
 import re
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -24,6 +26,7 @@ MODELO = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GMAIL_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+PAUSA_GEMINI = 8  # segundos entre consultas, para no pasar el límite por minuto del plan gratis
 SALIDA = pathlib.Path("docs/fechas.ics")
 CACHE = pathlib.Path("docs/cache.json")
 
@@ -95,6 +98,24 @@ def correos(token):
         yield asunto, f"Asunto: {asunto}\n{cuerpo_correo(msg['payload'])}"
 
 
+def llamar_gemini(instruccion):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELO}:generateContent"
+    datos = json.dumps({
+        "contents": [{"parts": [{"text": instruccion}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }).encode()
+    for intento in range(5):
+        try:
+            cuerpo, _ = http(url, {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}, datos)
+            return json.loads(cuerpo)["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as err:
+            if err.code != 429 or intento == 4:
+                raise
+            espera = 30 * (intento + 1)
+            print(f"Límite de Gemini alcanzado, espero {espera} segundos")
+            time.sleep(espera)
+
+
 def fechas_con_gemini(texto, origen):
     instruccion = (
         f"Hoy es {HOY.isoformat()}. Este texto viene de un curso universitario en Chile ({origen}). "
@@ -104,15 +125,7 @@ def fechas_con_gemini(texto, origen):
         '"tipo": "prueba" | "entrega" | "aviso"}. Si no hay fechas, responde [].\n\n'
         + texto[:30000]
     )
-    cuerpo, _ = http(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODELO}:generateContent",
-        {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
-        json.dumps({
-            "contents": [{"parts": [{"text": instruccion}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
-        }).encode(),
-    )
-    respuesta = json.loads(cuerpo)["candidates"][0]["content"]["parts"][0]["text"]
+    respuesta = llamar_gemini(instruccion)
     inicio, fin = respuesta.find("["), respuesta.rfind("]")
     return json.loads(respuesta[inicio : fin + 1]) if inicio != -1 else []
 
@@ -168,6 +181,7 @@ def generar_ics(eventos):
 def main():
     viejo = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
     nuevo, eventos, textos = {}, [], []
+    fallidas = 0
 
     # 1) Canvas: fechas exactas de tareas, y textos de anuncios, PDFs y páginas
     for curso in canvas("/api/v1/courses?enrollment_state=active&per_page=50"):
@@ -210,20 +224,23 @@ def main():
         except Exception as err:
             print(f"Gmail: {err}")
 
-    # 3) Gemini saca las fechas de todos los textos (con cache para no procesar dos veces lo mismo)
+    # 3) Gemini saca las fechas de los textos nuevos (lo ya leído sale de la cache)
     if GEMINI_KEY:
         for origen, texto in textos:
             if not texto.strip():
                 continue
             clave = hashlib.sha1((origen + texto).encode("utf-8")).hexdigest()
-            try:
-                if clave not in viejo:
+            if clave in viejo:
+                nuevo[clave] = viejo[clave]
+            else:
+                time.sleep(PAUSA_GEMINI)
+                try:
                     nuevo[clave] = fechas_con_gemini(texto, origen)
-                else:
-                    nuevo[clave] = viejo[clave]
-                eventos += [normalizar(e, origen) for e in nuevo[clave]]
-            except Exception as err:
-                print(f"No pude leer {origen}: {err}")
+                except Exception as err:
+                    fallidas += 1
+                    print(f"No pude leer {origen}: {err}")
+                    continue
+            eventos += [normalizar(e, origen) for e in nuevo[clave]]
     else:
         print("Sin GEMINI_API_KEY: solo se usaron las fechas de las tareas.")
 
@@ -240,7 +257,8 @@ def main():
 
     SALIDA.parent.mkdir(parents=True, exist_ok=True)
     SALIDA.write_text(generar_ics(finales), encoding="utf-8")
-    print(f"Fuentes de texto revisadas: {len(textos)}. Fechas en el calendario: {len(finales)}.")
+    print(f"Fuentes de texto revisadas: {len(textos)}. Fuentes que fallaron: {fallidas}. "
+          f"Fechas en el calendario: {len(finales)}.")
 
 
 if __name__ == "__main__":
