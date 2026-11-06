@@ -1,4 +1,4 @@
-"""Escanea Canvas (tareas, anuncios, módulos con PDFs y páginas) y Gmail,
+"""Escanea Canvas (tareas, anuncios, módulos con PDFs/Word y páginas) y Gmail,
 usa Gemini para sacar las fechas importantes y genera docs/fechas.ics."""
 import base64
 import datetime as dt
@@ -15,8 +15,11 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
+from docx import Document
 from pypdf import PdfReader
 
+INICIO = time.time()
+TIEMPO_MAX = 4 * 3600  # la corrida se detiene sola a las 4 horas; GitHub la corta a las 6
 ZONA = ZoneInfo("America/Santiago")
 HOY = dt.datetime.now(ZONA).date()
 CANVAS_URL = os.environ["CANVAS_URL"].rstrip("/")
@@ -27,8 +30,26 @@ GMAIL_ID = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 PAUSA_GEMINI = 8  # segundos entre consultas, para no pasar el límite por minuto del plan gratis
+PAGINAS_MAX = 80  # por PDF, para que la lectura no tarde demasiado
 SALIDA = pathlib.Path("docs/fechas.ics")
 CACHE = pathlib.Path("docs/cache.json")
+
+# 1) Por nombre: solo se consideran archivos que sugieran fechas
+PALABRAS_FECHAS = re.compile(
+    r"cronograma|programa|calendario|evaluaci|prueba|control|certam|solemne|examen|"
+    r"entrega|plazo|fecha|temario|informe",
+    re.IGNORECASE,
+)
+# 2) Por nombre: se descartan pautas y correcciones sin abrirlas
+DESCARTAR_NOMBRE = re.compile(r"pauta|correcci|soluci|respuesta|resuelt", re.IGNORECASE)
+# 3) Por contenido (inicio del documento): pautas y enunciados de controles
+DESCARTAR_INICIO = re.compile(r"pauta|correcci|soluci|respuestas|puntaje", re.IGNORECASE)
+PALABRAS_EXAMEN = re.compile(r"control|certamen|solemne|prueba|examen", re.IGNORECASE)
+PALABRAS_PREGUNTA = re.compile(r"pregunta|ítem|item", re.IGNORECASE)
+
+
+def sin_tiempo():
+    return time.time() - INICIO > TIEMPO_MAX
 
 
 def http(url, headers=None, data=None):
@@ -60,8 +81,24 @@ def local(iso):
     return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZONA)
 
 
-def texto_pdf(datos):
-    return "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(datos)).pages)
+def leer_archivo(nombre, datos):
+    """Devuelve el texto del archivo, o None si es una pauta o un enunciado de control."""
+    if nombre.lower().endswith(".docx"):
+        doc = Document(io.BytesIO(datos))
+        partes = [p.text for p in doc.paragraphs]
+        partes += [" | ".join(c.text for c in fila.cells) for tabla in doc.tables for fila in tabla.rows]
+    else:
+        lector = PdfReader(io.BytesIO(datos))
+        partes = []
+        for i, pagina in enumerate(lector.pages):
+            if i >= PAGINAS_MAX:
+                break
+            partes.append(pagina.extract_text() or "")
+    texto = "\n".join(partes)
+    inicio = texto[:1000]  # el título y lo de arriba suelen decir qué tipo de documento es
+    if DESCARTAR_INICIO.search(inicio) or (PALABRAS_EXAMEN.search(inicio) and PALABRAS_PREGUNTA.search(inicio)):
+        return None
+    return texto
 
 
 def token_gmail():
@@ -104,14 +141,14 @@ def llamar_gemini(instruccion):
         "contents": [{"parts": [{"text": instruccion}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }).encode()
-    for intento in range(5):
+    for intento in range(3):
         try:
             cuerpo, _ = http(url, {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}, datos)
             return json.loads(cuerpo)["candidates"][0]["content"]["parts"][0]["text"]
         except urllib.error.HTTPError as err:
-            if err.code != 429 or intento == 4:
+            if err.code != 429 or intento == 2:
                 raise
-            espera = 30 * (intento + 1)
+            espera = 20 * (intento + 1)
             print(f"Límite de Gemini alcanzado, espero {espera} segundos")
             time.sleep(espera)
 
@@ -178,13 +215,21 @@ def generar_ics(eventos):
     return "\r\n".join(lineas) + "\r\n"
 
 
+def guardar_cache(datos):
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+
+
 def main():
     viejo = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
-    nuevo, eventos, textos = {}, [], []
-    fallidas = 0
+    nuevo, eventos, textos = dict(viejo), [], []
+    fallidas, pendientes, seguidos_fallidos = 0, 0, 0
+    omitidos_nombre, omitidos_contenido = 0, 0
 
-    # 1) Canvas: fechas exactas de tareas, y textos de anuncios, PDFs y páginas
+    # 1) Canvas: fechas exactas de tareas, y textos de anuncios, archivos útiles y páginas
     for curso in canvas("/api/v1/courses?enrollment_state=active&per_page=50"):
+        if sin_tiempo():
+            break
         if not curso.get("id"):
             continue
         cid, nombre = curso["id"], curso.get("name", "Curso")
@@ -205,11 +250,23 @@ def main():
         try:
             for modulo in canvas(f"/api/v1/courses/{cid}/modules?include[]=items&per_page=100"):
                 for item in modulo.get("items", []):
+                    if sin_tiempo():
+                        break
                     if item.get("type") == "File":
+                        nombre_archivo = item.get("title", "")
+                        es_util = (nombre_archivo.lower().endswith((".pdf", ".docx"))
+                                   and PALABRAS_FECHAS.search(nombre_archivo)
+                                   and not DESCARTAR_NOMBRE.search(nombre_archivo))
+                        if not es_util:
+                            omitidos_nombre += 1  # ni siquiera se descarga
+                            continue
                         archivo = canvas(f"/api/v1/files/{item['content_id']}")[0]
-                        if "pdf" in archivo.get("content-type", ""):
-                            datos, _ = http(archivo["url"])
-                            textos.append((f"{nombre} - {archivo.get('display_name', 'PDF')}", texto_pdf(datos)))
+                        datos, _ = http(archivo["url"])
+                        texto = leer_archivo(nombre_archivo, datos)
+                        if texto is None:
+                            omitidos_contenido += 1  # era pauta o enunciado de control
+                            continue
+                        textos.append((f"{nombre} - {nombre_archivo}", texto))
                     elif item.get("type") == "Page":
                         pagina = canvas(f"/api/v1/courses/{cid}/pages/{item['page_url']}")[0]
                         textos.append((f"{nombre} - {pagina.get('title', 'página')}", limpio(pagina.get("body"))))
@@ -217,35 +274,38 @@ def main():
             print(f"Módulos de {nombre}: {err}")
 
     # 2) Gmail: correos de los últimos 30 días
-    if GMAIL_REFRESH:
+    if GMAIL_REFRESH and not sin_tiempo():
         try:
             for asunto, texto in correos(token_gmail()):
                 textos.append((f"Correo: {asunto}", texto))
         except Exception as err:
             print(f"Gmail: {err}")
 
-    # 3) Gemini saca las fechas de los textos nuevos (lo ya leído sale de la cache)
-    if GEMINI_KEY:
-        for origen, texto in textos:
-            if not texto.strip():
-                continue
-            clave = hashlib.sha1((origen + texto).encode("utf-8")).hexdigest()
-            if clave in viejo:
-                nuevo[clave] = viejo[clave]
-            else:
-                time.sleep(PAUSA_GEMINI)
-                try:
-                    nuevo[clave] = fechas_con_gemini(texto, origen)
-                except Exception as err:
-                    fallidas += 1
-                    print(f"No pude leer {origen}: {err}")
-                    continue
-            eventos += [normalizar(e, origen) for e in nuevo[clave]]
-    else:
+    # 3) Gemini saca las fechas de los textos nuevos; lo ya leído sale de la cache
+    if not GEMINI_KEY:
         print("Sin GEMINI_API_KEY: solo se usaron las fechas de las tareas.")
+    for origen, texto in textos:
+        if not texto.strip():
+            continue
+        clave = hashlib.sha1((origen + texto).encode("utf-8")).hexdigest()
+        if clave not in nuevo and GEMINI_KEY:
+            if sin_tiempo() or seguidos_fallidos >= 3:
+                pendientes += 1
+                continue
+            time.sleep(PAUSA_GEMINI)
+            try:
+                nuevo[clave] = fechas_con_gemini(texto, origen)
+                seguidos_fallidos = 0
+                guardar_cache(nuevo)  # se guarda con cada éxito, por si la corrida se corta
+            except Exception as err:
+                fallidas += 1
+                seguidos_fallidos += 1
+                print(f"No pude leer {origen}: {err}")
+                continue
+        if clave in nuevo:
+            eventos += [normalizar(e, origen) for e in nuevo[clave]]
 
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE.write_text(json.dumps(nuevo, ensure_ascii=False), encoding="utf-8")
+    guardar_cache(nuevo)
 
     # 4) Quitar repetidas y fechas pasadas, y guardar el calendario
     vistos, finales = set(), []
@@ -257,8 +317,9 @@ def main():
 
     SALIDA.parent.mkdir(parents=True, exist_ok=True)
     SALIDA.write_text(generar_ics(finales), encoding="utf-8")
-    print(f"Fuentes de texto revisadas: {len(textos)}. Fuentes que fallaron: {fallidas}. "
-          f"Fechas en el calendario: {len(finales)}.")
+    print(f"Fuentes de texto: {len(textos)}. Omitidos por nombre: {omitidos_nombre}. "
+          f"Omitidos por ser pauta o control: {omitidos_contenido}. Fallidas: {fallidas}. "
+          f"Pendientes para la próxima corrida: {pendientes}. Fechas en el calendario: {len(finales)}.")
 
 
 if __name__ == "__main__":
