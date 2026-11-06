@@ -31,6 +31,7 @@ GMAIL_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH = os.environ.get("GMAIL_REFRESH_TOKEN", "")
 PAUSA_GEMINI = 8  # segundos entre consultas, para no pasar el límite por minuto del plan gratis
 PAGINAS_MAX = 80  # por PDF, para que la lectura no tarde demasiado
+MAX_FALLOS_SEGUIDOS = 10  # solo se detiene si Gemini falla muchas veces seguidas
 SALIDA = pathlib.Path("docs/fechas.ics")
 CACHE = pathlib.Path("docs/cache.json")
 
@@ -141,15 +142,16 @@ def llamar_gemini(instruccion):
         "contents": [{"parts": [{"text": instruccion}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }).encode()
-    for intento in range(3):
+    for intento in range(5):
         try:
             cuerpo, _ = http(url, {"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"}, datos)
             return json.loads(cuerpo)["candidates"][0]["content"]["parts"][0]["text"]
         except urllib.error.HTTPError as err:
-            if err.code != 429 or intento == 2:
+            # 429 = límite de consultas, 500/503 = Gemini saturado: en ambos casos se espera y se reintenta
+            if err.code not in (429, 500, 503) or intento == 4:
                 raise
-            espera = 20 * (intento + 1)
-            print(f"Límite de Gemini alcanzado, espero {espera} segundos")
+            espera = 30 * (intento + 1)
+            print(f"Gemini respondió {err.code}, espero {espera} segundos")
             time.sleep(espera)
 
 
@@ -289,18 +291,20 @@ def main():
             continue
         clave = hashlib.sha1((origen + texto).encode("utf-8")).hexdigest()
         if clave not in nuevo and GEMINI_KEY:
-            if sin_tiempo() or seguidos_fallidos >= 3:
+            if sin_tiempo() or seguidos_fallidos >= MAX_FALLOS_SEGUIDOS:
                 pendientes += 1
                 continue
             time.sleep(PAUSA_GEMINI)
             try:
                 nuevo[clave] = fechas_con_gemini(texto, origen)
                 seguidos_fallidos = 0
+                print(f"{origen}: {len(nuevo[clave])} fechas")
                 guardar_cache(nuevo)  # se guarda con cada éxito, por si la corrida se corta
             except Exception as err:
                 fallidas += 1
                 seguidos_fallidos += 1
                 print(f"No pude leer {origen}: {err}")
+                time.sleep(60)
                 continue
         if clave in nuevo:
             eventos += [normalizar(e, origen) for e in nuevo[clave]]
